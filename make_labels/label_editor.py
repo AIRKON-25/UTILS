@@ -583,6 +583,8 @@ class LabelEditorApp:
         self.load_current_sample()
 
     def load_current_sample(self) -> None:
+        prev_zoom_level = self.zoom_level
+        prev_zoom_center = self.zoom_center
         self.undo_stack.clear()
         sample = self.samples[self.idx]
         img_bgr = cv2.imread(sample.image_path, cv2.IMREAD_COLOR)
@@ -597,12 +599,21 @@ class LabelEditorApp:
         self.entries = load_labels(sample.label_path)
         self.dirty = False
         self.image_shape = img_rgb.shape[:2]
-        self.zoom_level = 1.0
-        self.zoom_center = None
+        if prev_zoom_level > 1.01:
+            self.zoom_level = min(max(prev_zoom_level, 1.0), 20.0)
+            self.zoom_center = self.clamp_zoom_center(prev_zoom_center, self.zoom_level)
+        else:
+            self.zoom_level = 1.0
+            self.zoom_center = None
         copied = self.apply_pending_copies()
         removed = self.remove_labels_in_roi(update_view=False, announce=False)
         self.refresh_patches()
-        self.apply_zoom(reset=True)
+        if self.zoom_level > 1.01:
+            if self.zoom_center is None:
+                self.zoom_center = self.clamp_zoom_center(None, self.zoom_level)
+            self.apply_zoom()
+        else:
+            self.apply_zoom(reset=True)
         if copied and removed:
             self.set_status(
                 f"복사된 라벨을 추가하고 삭제 영역에서 {removed}개를 제거했습니다."
@@ -779,6 +790,21 @@ class LabelEditorApp:
         else:
             self.roi_preview_line.set_data(xs, ys)
         self.fig.canvas.draw_idle()
+
+    def clamp_zoom_center(
+        self, center: Optional[Tuple[float, float]], zoom_level: float
+    ) -> Tuple[float, float]:
+        if not self.image_shape:
+            return center if center is not None else (0.0, 0.0)
+        h, w = self.image_shape
+        if center is None:
+            return (w / 2.0, h / 2.0)
+        cx, cy = center
+        half_w = max(5.0, min(w / (2 * zoom_level), w / 2.0))
+        half_h = max(5.0, min(h / (2 * zoom_level), h / 2.0))
+        cx = min(max(cx, half_w), w - half_w)
+        cy = min(max(cy, half_h), h - half_h)
+        return (cx, cy)
 
     def apply_zoom(self, reset: bool = False) -> None:
         if not self.image_shape:
