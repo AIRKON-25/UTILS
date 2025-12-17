@@ -34,7 +34,9 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colors as mcolors
-from matplotlib.patches import Polygon, Rectangle
+from matplotlib.lines import Line2D
+from matplotlib.path import Path
+from matplotlib.patches import Polygon
 
 
 # Use Korean-capable fonts if available and keep minus signs readable.
@@ -350,10 +352,20 @@ class LabelEditorApp:
         self.pending_copies: List[LabelEntry] = []
         self.roi_mode = False
         self.roi_points: List[Tuple[float, float]] = []
-        self.delete_roi_rect: Optional[Tuple[float, float, float, float]] = None
-        self.roi_patch: Optional[Rectangle] = None
+        self.delete_roi_polygons: List[Tuple[np.ndarray, Path]] = []
+        self.roi_patches: List[Polygon] = []
+        self.roi_dragging = False
+        self.roi_preview_line: Optional[Line2D] = None
+        self.image_shape: Optional[Tuple[int, int]] = None
+        self.zoom_level = 1.0
+        self.zoom_center: Optional[Tuple[float, float]] = None
+        self.last_cursor: Optional[Tuple[float, float]] = None
         self.undo_stack: List[dict] = []
         self.max_undo = 50
+        self.drag_move_all = False
+        self.pan_mode = False
+        self.pan_start: Optional[Tuple[float, float]] = None
+        self.pan_start_disp: Optional[Tuple[float, float]] = None
 
         self.fig, self.ax = plt.subplots(figsize=(12, 7))
         self.ax.axis("off")
@@ -366,7 +378,7 @@ class LabelEditorApp:
         self.help_text = self.fig.text(
             0.5,
             0.015,
-            "n/p(or ←/→): prev/next · a: add · esc: cancel add · d: delete · f: flip dir · drag point: move · r: toggle delete ROI · y: toggle copy · u: clear copy · ctrl+z: undo · s: save · 0-9: set class (selected/new) · q: quit",
+            "n/p(or ←/→): prev/next · a: add · esc: cancel add · d: delete · f: flip dir · drag point: move · m: toggle center drag mode · z/x: zoom in/out · shift+z: reset zoom · space+drag: pan · r: draw ROI (freehand) · ctrl+r: clear all ROI · y: toggle copy · u: clear copy · ctrl+z: undo · s: save · 0-9: set class (selected/new) · q: quit",
             ha="center",
             va="bottom",
             fontsize=9,
@@ -433,10 +445,16 @@ class LabelEditorApp:
         copy_text = (
             f" · copy:{len(self.copy_mark_indices)}" if self.copy_mark_indices else ""
         )
-        roi_text = " · ROI" if self.delete_roi_rect else ""
+        roi_text = (
+            f" · ROI:{len(self.delete_roi_polygons)}" if self.delete_roi_polygons else ""
+        )
+        drag_text = " · drag=all" if self.drag_move_all else ""
+        zoom_text = (
+            f" · zoom:{self.zoom_level:.1f}x" if self.zoom_level > 1.01 else ""
+        )
         self.info_text.set_text(
             f"{self.idx + 1}/{len(self.samples)}{dirty_flag} · {rel_label} · "
-            f"labels: {len(self.entries)} · new-class: {self.current_class}{copy_text}{roi_text}"
+            f"labels: {len(self.entries)} · new-class: {self.current_class}{copy_text}{roi_text}{drag_text}{zoom_text}"
         )
 
     def refresh_patches(self) -> None:
@@ -559,6 +577,9 @@ class LabelEditorApp:
         if self.roi_mode:
             self.roi_mode = False
             self.roi_points.clear()
+        self.pan_mode = False
+        self.pan_start = None
+        self.pan_start_disp = None
         self.load_current_sample()
 
     def load_current_sample(self) -> None:
@@ -575,9 +596,13 @@ class LabelEditorApp:
         self.ax.set_title(os.path.relpath(sample.image_path, self.root_dir))
         self.entries = load_labels(sample.label_path)
         self.dirty = False
+        self.image_shape = img_rgb.shape[:2]
+        self.zoom_level = 1.0
+        self.zoom_center = None
         copied = self.apply_pending_copies()
         removed = self.remove_labels_in_roi(update_view=False, announce=False)
         self.refresh_patches()
+        self.apply_zoom(reset=True)
         if copied and removed:
             self.set_status(
                 f"복사된 라벨을 추가하고 삭제 영역에서 {removed}개를 제거했습니다."
@@ -588,6 +613,9 @@ class LabelEditorApp:
             self.set_status(f"삭제 영역에서 {removed}개의 라벨을 제거했습니다.")
         else:
             self.set_status("이미지 로드 완료.")
+        self.last_cursor = None
+        self.pan_start = None
+        self.pan_start_disp = None
 
     def pick_entry(self, x: float, y: float, max_dist: float = 35.0) -> Optional[int]:
         best_idx = None
@@ -656,8 +684,18 @@ class LabelEditorApp:
         start = self.drag_state["start"]
         point = self.drag_state["point"]
         if point == "center":
-            entry.cx = px
-            entry.cy = py
+            if self.drag_move_all:
+                dx = px - start["cx"]
+                dy = py - start["cy"]
+                entry.cx = px
+                entry.cy = py
+                entry.f1x = start["f1x"] + dx
+                entry.f1y = start["f1y"] + dy
+                entry.f2x = start["f2x"] + dx
+                entry.f2y = start["f2y"] + dy
+            else:
+                entry.cx = px
+                entry.cy = py
         elif point == "front1":
             entry.f1x = px
             entry.f1y = py
@@ -699,25 +737,146 @@ class LabelEditorApp:
         self.set_status("마지막 작업을 취소했습니다.")
 
     def update_roi_patch(self) -> None:
-        if self.roi_patch is not None:
-            self.roi_patch.remove()
-            self.roi_patch = None
-        if not self.delete_roi_rect:
+        for patch in self.roi_patches:
+            patch.remove()
+        self.roi_patches = []
+        self.clear_roi_preview(redraw=False)
+        if not self.delete_roi_polygons:
             return
-        x1, y1, x2, y2 = self.delete_roi_rect
-        width = max(1.0, x2 - x1)
-        height = max(1.0, y2 - y1)
-        patch = Rectangle(
-            (x1, y1),
-            width,
-            height,
-            linewidth=1.8,
-            edgecolor="#00ffc3",
-            facecolor="none",
-            linestyle="--",
-        )
-        self.ax.add_patch(patch)
-        self.roi_patch = patch
+        for points, _ in self.delete_roi_polygons:
+            patch = Polygon(
+                points,
+                closed=True,
+                linewidth=1.8,
+                edgecolor="#00ffc3",
+                facecolor="none",
+                linestyle="--",
+            )
+            self.ax.add_patch(patch)
+            self.roi_patches.append(patch)
+
+    def clear_roi_preview(self, redraw: bool = True) -> None:
+        if self.roi_preview_line is not None:
+            self.roi_preview_line.remove()
+            self.roi_preview_line = None
+            if redraw:
+                self.fig.canvas.draw_idle()
+
+    def update_roi_preview(self) -> None:
+        if not self.roi_points:
+            self.clear_roi_preview()
+            return
+        xs, ys = zip(*self.roi_points)
+        if self.roi_preview_line is None:
+            (line,) = self.ax.plot(
+                xs,
+                ys,
+                color="#00ffc3",
+                linestyle=":",
+                linewidth=1.5,
+            )
+            self.roi_preview_line = line
+        else:
+            self.roi_preview_line.set_data(xs, ys)
+        self.fig.canvas.draw_idle()
+
+    def apply_zoom(self, reset: bool = False) -> None:
+        if not self.image_shape:
+            return
+        h, w = self.image_shape
+        if reset or self.zoom_level <= 1.0:
+            self.zoom_level = 1.0
+            self.zoom_center = (w / 2.0, h / 2.0)
+            self.ax.set_xlim(0, w)
+            self.ax.set_ylim(h, 0)
+            self.fig.canvas.draw_idle()
+            self.update_info()
+            return
+        cx, cy = self.zoom_center or (w / 2.0, h / 2.0)
+        half_w = w / (2 * self.zoom_level)
+        half_h = h / (2 * self.zoom_level)
+        half_w = max(5.0, min(half_w, w / 2.0))
+        half_h = max(5.0, min(half_h, h / 2.0))
+        x_min = max(0.0, cx - half_w)
+        x_max = min(w, cx + half_w)
+        y_min = max(0.0, cy - half_h)
+        y_max = min(h, cy + half_h)
+        self.ax.set_xlim(x_min, x_max)
+        self.ax.set_ylim(y_max, y_min)
+        self.fig.canvas.draw_idle()
+        self.update_info()
+
+    def zoom_in(self) -> None:
+        if not self.image_shape:
+            self.set_status("줌을 사용할 수 없습니다.")
+            return
+        if self.last_cursor:
+            self.zoom_center = self.last_cursor
+        self.zoom_level = min(self.zoom_level * 1.5, 20.0)
+        if self.zoom_level <= 1.02:
+            self.apply_zoom(reset=True)
+        else:
+            self.apply_zoom()
+            self.set_status(f"확대: {self.zoom_level:.1f}x")
+
+    def zoom_out(self) -> None:
+        if not self.image_shape:
+            self.set_status("줌을 사용할 수 없습니다.")
+            return
+        self.zoom_level = max(1.0, self.zoom_level / 1.5)
+        if self.zoom_level <= 1.02:
+            self.apply_zoom(reset=True)
+            self.set_status("줌을 초기화했습니다.")
+        else:
+            if self.last_cursor:
+                self.zoom_center = self.last_cursor
+            self.apply_zoom()
+            self.set_status(f"축소: {self.zoom_level:.1f}x")
+
+    def reset_zoom(self) -> None:
+        if not self.image_shape:
+            return
+        self.zoom_level = 1.0
+        self.apply_zoom(reset=True)
+        self.set_status("줌을 초기화했습니다.")
+
+    def handle_pan(
+        self,
+        data_x: Optional[float],
+        data_y: Optional[float],
+        disp_x: float,
+        disp_y: float,
+    ) -> None:
+        if not self.image_shape or not self.zoom_center or self.zoom_level <= 1.0:
+            return
+        if not self.pan_start or not self.pan_start_disp:
+            return
+        bbox = self.ax.get_window_extent()
+        width = max(bbox.width, 1.0)
+        height = max(bbox.height, 1.0)
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        x_span = abs(xlim[1] - xlim[0])
+        y_span = abs(ylim[1] - ylim[0])
+        x_sign = 1.0 if xlim[1] >= xlim[0] else -1.0
+        y_sign = 1.0 if ylim[1] >= ylim[0] else -1.0
+        disp_dx = disp_x - self.pan_start_disp[0]
+        disp_dy = disp_y - self.pan_start_disp[1]
+        if abs(disp_dx) < 0.5 and abs(disp_dy) < 0.5:
+            return
+        data_dx = disp_dx * (x_span / width) * x_sign
+        data_dy = disp_dy * (y_span / height) * y_sign
+        cx, cy = self.zoom_center
+        h, w = self.image_shape
+        half_w = max(5.0, min(w / (2 * self.zoom_level), w / 2.0))
+        half_h = max(5.0, min(h / (2 * self.zoom_level), h / 2.0))
+        new_cx = min(max(cx - data_dx, half_w), w - half_w)
+        new_cy = min(max(cy - data_dy, half_h), h - half_h)
+        self.zoom_center = (new_cx, new_cy)
+        self.pan_start_disp = (disp_x, disp_y)
+        if data_x is not None and data_y is not None:
+            self.pan_start = (data_x, data_y)
+        self.apply_zoom()
 
     def toggle_copy_mark(self) -> None:
         if self.selected_idx is None:
@@ -737,40 +896,59 @@ class LabelEditorApp:
         if self.roi_mode:
             self.roi_mode = False
             self.roi_points.clear()
+            self.roi_dragging = False
+            self.clear_roi_preview()
             self.set_status("삭제 영역 지정을 취소했습니다.")
-            return
-        if self.delete_roi_rect:
-            self.clear_roi()
             return
         if self.mode == "add":
             self.toggle_add_mode()
         self.roi_mode = True
         self.roi_points.clear()
-        self.set_status("삭제 영역 지정: 첫 번째 코너를 클릭하세요.")
+        self.roi_dragging = False
+        self.clear_roi_preview()
+        self.set_status("삭제 영역 지정: 마우스로 영역을 그려주세요 (드래그 후 놓기).")
 
-    def clear_roi(self) -> None:
-        if not self.delete_roi_rect:
+    def clear_all_rois(self) -> None:
+        if not self.delete_roi_polygons:
             self.set_status("활성화된 삭제 영역이 없습니다.")
             return
-        self.delete_roi_rect = None
+        self.delete_roi_polygons = []
         self.update_roi_patch()
-        self.set_status("삭제 영역을 해제했습니다.")
+        self.set_status("모든 삭제 영역을 해제했습니다.")
         self.update_info()
 
+    def toggle_drag_move_all(self) -> None:
+        self.drag_move_all = not self.drag_move_all
+        mode = "전체 이동" if self.drag_move_all else "중심만 이동"
+        self.update_info()
+        self.set_status(f"센터 드래그 모드: {mode}")
+
     def finalize_roi(self) -> None:
-        if len(self.roi_points) < 2:
+        if len(self.roi_points) < 3:
+            self.set_status("삭제 영역은 최소 3개의 점이 필요합니다.")
+            self.roi_points.clear()
+            self.roi_mode = False
+            self.roi_dragging = False
+            self.clear_roi_preview()
             return
-        (x1, y1), (x2, y2) = self.roi_points[:2]
-        if x1 == x2 or y1 == y2:
+        poly = np.array(self.roi_points, dtype=np.float32)
+        if not np.allclose(poly[0], poly[-1]):
+            poly = np.vstack([poly, poly[0]])
+        area = 0.5 * np.abs(
+            np.dot(poly[:-1, 0], poly[1:, 1]) - np.dot(poly[:-1, 1], poly[1:, 0])
+        )
+        if area < 10.0:
             self.set_status("삭제 영역이 너무 작습니다. 다시 지정하세요.")
             self.roi_points.clear()
             self.roi_mode = False
+            self.roi_dragging = False
+            self.clear_roi_preview()
             return
-        xmin, xmax = sorted([x1, x2])
-        ymin, ymax = sorted([y1, y2])
-        self.delete_roi_rect = (xmin, ymin, xmax, ymax)
+        self.delete_roi_polygons.append((poly, Path(poly)))
         self.roi_mode = False
         self.roi_points.clear()
+        self.roi_dragging = False
+        self.clear_roi_preview()
         removed = self.remove_labels_in_roi(record_undo=True)
         self.update_roi_patch()
         if removed:
@@ -824,9 +1002,8 @@ class LabelEditorApp:
         announce: bool = False,
         record_undo: bool = False,
     ) -> int:
-        if not self.delete_roi_rect:
+        if not self.delete_roi_polygons:
             return 0
-        x1, y1, x2, y2 = self.delete_roi_rect
         old_entries = self.entries
         new_entries: List[LabelEntry] = []
         new_marks: Set[int] = set()
@@ -835,7 +1012,7 @@ class LabelEditorApp:
         selected_idx = self.selected_idx
         for idx, entry in enumerate(old_entries):
             cx, cy = entry.center_point()
-            if x1 <= cx <= x2 and y1 <= cy <= y2:
+            if any(path.contains_point((cx, cy)) for _, path in self.delete_roi_polygons):
                 removed += 1
                 continue
             new_entries.append(entry)
@@ -865,12 +1042,17 @@ class LabelEditorApp:
         x, y = float(event.xdata), float(event.ydata)
 
         if self.roi_mode:
-            self.roi_points.append((x, y))
-            if len(self.roi_points) >= 2:
-                self.finalize_roi()
-            else:
-                self.set_status("삭제 영역 지정: 두 번째 코너를 클릭하세요.")
+            if event.button != 1:
+                return
+            self.roi_dragging = True
+            self.roi_points = [(x, y)]
+            self.update_roi_preview()
+            self.set_status("삭제 영역 지정: 마우스를 드래그한 뒤 놓으면 완료됩니다.")
             return
+        self.last_cursor = (x, y)
+        self.pan_mode = False
+        self.pan_start = None
+        self.pan_start_disp = None
 
         if self.mode == "add":
             self.add_points.append((x, y))
@@ -888,23 +1070,56 @@ class LabelEditorApp:
                 entry_idx, point_name = picked_point
                 self.start_drag(entry_idx, point_name, x, y)
                 return
+            picked = self.pick_entry(x, y)
+            if picked is None:
+                if self.zoom_level > 1.01:
+                    self.pan_mode = True
+                    self.pan_start = (x, y)
+                    if event.x is not None and event.y is not None:
+                        self.pan_start_disp = (float(event.x), float(event.y))
+                else:
+                    self.selected_idx = None
+                    self.refresh_patches()
+                    self.set_status("선택된 라벨 없음.")
+                return
 
-        picked = self.pick_entry(x, y)
-        if picked is None:
-            self.selected_idx = None
+            self.pan_mode = False
+            self.selected_idx = picked
             self.refresh_patches()
-            self.set_status("선택된 라벨 없음.")
+            entry = self.entries[picked]
+            sc_text = (
+                f"{entry.score:.3f}" if entry.score is not None else "없음"
+            )
+            self.set_status(f"라벨 #{picked + 1} 선택 (score={sc_text}).")
             return
 
-        self.selected_idx = picked
-        self.refresh_patches()
-        entry = self.entries[picked]
-        sc_text = (
-            f"{entry.score:.3f}" if entry.score is not None else "없음"
-        )
-        self.set_status(f"라벨 #{picked + 1} 선택 (score={sc_text}).")
-
     def on_motion(self, event) -> None:
+        if (
+            self.roi_mode
+            and self.roi_dragging
+            and event.xdata is not None
+            and event.ydata is not None
+            and event.inaxes == self.ax
+        ):
+            x, y = float(event.xdata), float(event.ydata)
+            if not self.roi_points or np.hypot(
+                x - self.roi_points[-1][0], y - self.roi_points[-1][1]
+            ) >= 2.0:
+                self.roi_points.append((x, y))
+                self.update_roi_preview()
+            return
+        if (
+            self.pan_mode
+            and self.pan_start
+            and event.x is not None
+            and event.y is not None
+        ):
+            data_x = float(event.xdata) if event.xdata is not None else None
+            data_y = float(event.ydata) if event.ydata is not None else None
+            self.handle_pan(data_x, data_y, float(event.x), float(event.y))
+            return
+        if event.xdata is not None and event.ydata is not None:
+            self.last_cursor = (float(event.xdata), float(event.ydata))
         if not self.drag_state or event.xdata is None or event.ydata is None:
             return
         if event.inaxes != self.ax:
@@ -912,6 +1127,22 @@ class LabelEditorApp:
         self.update_drag(float(event.xdata), float(event.ydata))
 
     def on_release(self, event) -> None:
+        if event.button == 1 and self.roi_mode and self.roi_dragging:
+            self.roi_dragging = False
+            if event.xdata is not None and event.ydata is not None:
+                self.roi_points.append((float(event.xdata), float(event.ydata)))
+                self.finalize_roi()
+            else:
+                self.roi_points.clear()
+                self.roi_mode = False
+                self.clear_roi_preview()
+                self.set_status("삭제 영역 지정을 취소했습니다.")
+            return
+        if self.pan_mode and self.pan_start and event.button == 1:
+            self.pan_start = None
+            self.pan_start_disp = None
+            self.pan_mode = False
+            return
         if event.button != 1:
             return
         if self.drag_state is None:
@@ -1046,14 +1277,42 @@ class LabelEditorApp:
             self.flip_selected()
         elif key == "a":
             self.toggle_add_mode()
+        elif key == "m":
+            self.toggle_drag_move_all()
         elif key == "y":
             self.toggle_copy_mark()
         elif key == "u":
             self.clear_copy_marks()
         elif key == "r":
             self.toggle_roi_mode()
+        elif key == "ctrl+r":
+            self.clear_all_rois()
+        elif key == "z":
+            self.zoom_in()
+        elif key == "x":
+            self.zoom_out()
+        elif key == "shift+z":
+            self.reset_zoom()
         elif key == "ctrl+z":
             self.undo()
+        elif key == "space":
+            if self.pan_mode:
+                self.pan_mode = False
+                self.pan_start = None
+                self.pan_start_disp = None
+            else:
+                if self.zoom_level <= 1.01:
+                    self.set_status("확대한 상태에서만 화면을 이동할 수 있습니다.")
+                    return
+                self.pan_mode = True
+                self.pan_start = self.last_cursor
+                if self.last_cursor is not None:
+                    disp_pt = self.ax.transData.transform(self.last_cursor)
+                    self.pan_start_disp = (float(disp_pt[0]), float(disp_pt[1]))
+                else:
+                    self.pan_start_disp = None
+            mode = "on" if self.pan_mode else "off"
+            self.set_status(f"팬 모드: {mode}. 마우스를 드래그해 화면을 이동하세요.")
         elif len(key) == 1 and key.isdigit():
             digit = int(key)
             if self.selected_idx is not None:
